@@ -29,6 +29,7 @@ import type { SQL } from "drizzle-orm"
 import { PartTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { MessageV2 } from "./message-v2"
+import { ForkContext } from "./llm/fork"
 import type { InstanceContext } from "../project/instance-context"
 import { InstanceState } from "@/effect/instance-state"
 import { Snapshot } from "@/snapshot"
@@ -422,7 +423,18 @@ export interface Interface {
     permission?: PermissionV1.Ruleset
     workspaceID?: WorkspaceV2.ID
   }) => Effect.Effect<Info>
-  readonly fork: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<Info, NotFound>
+  readonly fork: (input: {
+    sessionID: SessionID
+    messageID?: MessageID
+    child?: {
+      parentID: SessionID
+      title: string
+      agent: string
+      model?: Schema.Schema.Type<typeof Model>
+      permission: PermissionV1.Ruleset
+      metadata: Record<string, unknown>
+    }
+  }) => Effect.Effect<Info, NotFound>
   readonly touch: (sessionID: SessionID) => Effect.Effect<void>
   readonly get: (id: SessionID) => Effect.Effect<Info, NotFound>
   readonly setTitle: (input: { sessionID: SessionID; title: string }) => Effect.Effect<void>
@@ -688,30 +700,31 @@ const layer: Layer.Layer<
       })
     })
 
-    const fork = Effect.fn("Session.fork")(function* (input: { sessionID: SessionID; messageID?: MessageID }) {
+    const fork: Interface["fork"] = Effect.fn("Session.fork")(function* (input) {
       const ctx = yield* InstanceState.context
       const original = yield* get(input.sessionID)
-      const title = getForkedTitle(original.title)
+      const msgs = yield* messages({ sessionID: input.sessionID })
+      const target = input.messageID ? msgs.findIndex((msg) => msg.info.id === input.messageID) : msgs.length
+      if (input.child && (!input.messageID || target < 0)) {
+        return yield* new NotFoundError({ message: `Task fork cutoff message not found: ${input.messageID}` })
+      }
+      const copied = msgs.slice(0, target < 0 ? msgs.length : target).map((msg) => ({ msg, id: MessageID.ascending() }))
+      const idMap = new Map(copied.map((item) => [item.msg.info.id, item.id]))
       const session = yield* createNext({
         directory: ctx.directory,
         path: sessionPath(ctx.worktree, ctx.directory),
         workspaceID: original.workspaceID,
-        title,
-        metadata: structuredClone(original.metadata),
+        ...(input.child ?? {
+          title: getForkedTitle(original.title),
+          metadata: ForkContext.remapMetadata(original.metadata, idMap),
+        }),
       })
-      const msgs = yield* messages({ sessionID: input.sessionID })
-      const idMap = new Map<string, MessageID>()
-      const target = input.messageID ? msgs.findIndex((msg) => msg.info.id === input.messageID) : msgs.length
-
-      for (const msg of msgs.slice(0, target < 0 ? msgs.length : target)) {
-        const newID = MessageID.ascending()
-        idMap.set(msg.info.id, newID)
-
+      for (const { msg, id } of copied) {
         const parentID = msg.info.role === "assistant" && msg.info.parentID ? idMap.get(msg.info.parentID) : undefined
         const cloned = yield* updateMessage({
           ...msg.info,
           sessionID: session.id,
-          id: newID,
+          id,
           ...(parentID && { parentID }),
         })
 

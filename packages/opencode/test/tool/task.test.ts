@@ -24,6 +24,7 @@ import { disposeAllInstances } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { ForkContext } from "@/session/llm/fork"
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -32,6 +33,15 @@ afterEach(async () => {
 const ref = {
   providerID: ProviderV2.ID.make("test"),
   modelID: ModelV2.ID.make("test-model"),
+}
+
+function forkContext(): ForkContext.Turn {
+  return {
+    snapshot: ForkContext.capture(
+      { ...ref, apiID: ref.modelID, npm: "@ai-sdk/openai", agent: "build", variant: "xhigh" },
+      { prompt: [{ role: "user", content: [{ type: "text", text: "parent context" }] }] },
+    ),
+  }
 }
 
 const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
@@ -168,6 +178,165 @@ function reply(
 }
 
 describe("tool.task", () => {
+  it.instance(
+    "fork inherits identity and permissions and resumes without recopying before and after compaction",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        yield* sessions.setPermission({
+          sessionID: chat.id,
+          permission: [{ permission: "edit", pattern: "*", action: "deny" }],
+        })
+        yield* sessions.setMetadata({ sessionID: chat.id, metadata: { unrelated: true } })
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const prompts: SessionPrompt.PromptInput[] = []
+        const context = {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { forkContext: forkContext(), promptOps: stubOps({ onPrompt: (input) => prompts.push(input) }) },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        }
+        const isolated = yield* def.execute(
+          { description: "isolated", prompt: "work", subagent_type: "build" },
+          context,
+        )
+        const result = yield* def.execute({ description: "fork", prompt: "work", fork: true }, context)
+        const child = yield* sessions.get(result.metadata.sessionId)
+        expect(child.parentID).toBe(chat.id)
+        expect(child.agent).toBe("build")
+        expect(child.model).toEqual({ id: ref.modelID, providerID: ref.providerID, variant: "xhigh" })
+        expect(child.permission).toEqual((yield* sessions.get(isolated.metadata.sessionId)).permission)
+        expect(child.permission).toContainEqual({ permission: "edit", pattern: "*", action: "deny" })
+        expect(child.metadata?.unrelated).toBeUndefined()
+        expect(ForkContext.read(child.metadata)?.firstUserMessageID).toBe(prompts[1]?.messageID)
+        expect(prompts[1]).toMatchObject({ model: ref, variant: "xhigh", agent: "build" })
+        const history = yield* sessions.messages({ sessionID: child.id })
+        expect(history).toHaveLength(1)
+        expect(history[0]?.info.role).toBe("user")
+        yield* sessions.updateMessage({ ...assistant, modelID: ModelV2.ID.make("changed"), variant: "low" })
+        yield* sessions.setAgentModel({
+          sessionID: child.id,
+          agent: "general",
+          model: { id: ModelV2.ID.make("changed"), providerID: ref.providerID },
+          time: Date.now(),
+        })
+        yield* def.execute({ description: "resume", prompt: "continue", task_id: child.id }, context)
+        expect(prompts[2]).toMatchObject({ sessionID: child.id, model: ref, variant: "xhigh", agent: "build" })
+        expect(prompts[2]?.messageID).not.toBe(prompts[1]?.messageID)
+        expect(yield* sessions.messages({ sessionID: child.id })).toEqual(history)
+        expect(yield* sessions.children(chat.id)).toHaveLength(2)
+        const compactedMetadata = ForkContext.clearMetadata(child.metadata)
+        expect(ForkContext.read(compactedMetadata)).toBeUndefined()
+        yield* sessions.setMetadata({ sessionID: child.id, metadata: compactedMetadata })
+        yield* sessions.updateMessage({
+          ...assistant,
+          agent: "general",
+          modelID: ModelV2.ID.make("other-model"),
+          providerID: ProviderV2.ID.make("other-provider"),
+          variant: "low",
+        })
+        const resumed = yield* def.execute(
+          { description: "resume compacted", prompt: "continue after summary", task_id: child.id },
+          { ...context, agent: "general", extra: { promptOps: context.extra.promptOps } },
+        )
+        expect(resumed.metadata.sessionId).toBe(child.id)
+        expect(prompts[3]).toMatchObject({ sessionID: child.id, model: ref, variant: "xhigh", agent: "build" })
+        expect(prompts[3]?.messageID).not.toBe(prompts[2]?.messageID)
+        expect(yield* sessions.messages({ sessionID: child.id })).toEqual(history)
+        expect(yield* sessions.children(chat.id)).toHaveLength(2)
+        yield* sessions.setMetadata({ sessionID: child.id, metadata: { opencode_fork_context: { version: 99 } } })
+        expect(
+          Exit.isFailure(
+            yield* def
+              .execute({ description: "bad metadata", prompt: "work", task_id: child.id }, context)
+              .pipe(Effect.exit),
+          ),
+        ).toBe(true)
+        expect(prompts).toHaveLength(4)
+      }),
+    { config: { agent: { build: { model: "test/override" } }, experimental: { primary_tools: ["bash"] } } },
+  )
+
+  it.instance("denied forks and depth failures create no child", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const context = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { forkContext: forkContext(), promptOps: stubOps() },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.die(new Error("denied")),
+      }
+      expect(
+        Exit.isFailure(
+          yield* def.execute({ description: "denied", prompt: "work", fork: true }, context).pipe(Effect.exit),
+        ),
+      ).toBe(true)
+      expect(yield* sessions.children(chat.id)).toHaveLength(0)
+      const child = yield* sessions.create({ parentID: chat.id })
+      expect(
+        Exit.isFailure(
+          yield* def
+            .execute(
+              { description: "nested", prompt: "work", fork: true },
+              { ...context, sessionID: child.id, ask: () => Effect.void },
+            )
+            .pipe(Effect.exit),
+        ),
+      ).toBe(true)
+      expect(yield* sessions.children(child.id)).toHaveLength(0)
+    }),
+  )
+
+  it.instance("rejects invalid fork requests before creating a child", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      expect(def.description).toContain("fork-context-v1")
+      for (const input of [
+        { fork: true },
+        { fork: true, subagent_type: "general" },
+        { fork: true, task_id: chat.id },
+        {},
+      ]) {
+        const exit = yield* def
+          .execute(
+            { description: "invalid fork", prompt: "work", ...input },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: { promptOps: stubOps() },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit) && input.fork && !input.subagent_type && !input.task_id) {
+          expect(String(Cause.squash(exit.cause))).toContain("configured AI SDK provider")
+        }
+        expect(yield* sessions.children(chat.id)).toHaveLength(0)
+      }
+    }),
+  )
+
   it.instance(
     "description sorts subagents by name and is stable across calls",
     () =>
@@ -417,55 +586,58 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("execute cancels child session when abort signal fires", () =>
-    Effect.gen(function* () {
-      const { chat, assistant } = yield* seed()
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
-      const ready = defer<SessionPrompt.PromptInput>()
-      const cancelled = defer<SessionID>()
-      const abort = new AbortController()
-      const promptOps: TaskPromptOps = {
-        cancel: (sessionID) =>
-          Effect.sync(() => {
-            cancelled.resolve(sessionID)
-          }),
-        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
-        prompt: (input) =>
-          Effect.promise(() => {
-            ready.resolve(input)
-            return cancelled.promise
-          }).pipe(Effect.as(reply(input, "cancelled"))),
-      }
+  for (const fork of [false, true]) {
+    it.instance(`execute cancels child session when abort signal fires (fork=${fork})`, () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const ready = defer<SessionPrompt.PromptInput>()
+        const cancelled = defer<SessionID>()
+        const abort = new AbortController()
+        const promptOps: TaskPromptOps = {
+          cancel: (sessionID) =>
+            Effect.sync(() => {
+              cancelled.resolve(sessionID)
+            }),
+          resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+          prompt: (input) =>
+            Effect.promise(() => {
+              ready.resolve(input)
+              return cancelled.promise
+            }).pipe(Effect.as(reply(input, "cancelled"))),
+        }
 
-      const fiber = yield* def
-        .execute(
-          {
-            description: "inspect bug",
-            prompt: "look into the cache key path",
-            subagent_type: "general",
-          },
-          {
-            sessionID: chat.id,
-            messageID: assistant.id,
-            agent: "build",
-            abort: abort.signal,
-            extra: { promptOps },
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.void,
-          },
-        )
-        .pipe(Effect.forkChild)
+        const fiber = yield* def
+          .execute(
+            {
+              description: "inspect bug",
+              prompt: "look into the cache key path",
+              subagent_type: fork ? undefined : "general",
+              fork,
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "build",
+              abort: abort.signal,
+              extra: { promptOps, forkContext: forkContext() },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.forkChild)
 
-      const input = yield* Effect.promise(() => ready.promise)
-      abort.abort()
-      expect(yield* Effect.promise(() => cancelled.promise)).toBe(input.sessionID)
+        const input = yield* Effect.promise(() => ready.promise)
+        abort.abort()
+        expect(yield* Effect.promise(() => cancelled.promise)).toBe(input.sessionID)
 
-      const exit = yield* Fiber.await(fiber)
-      expect(Exit.isSuccess(exit)).toBe(true)
-    }),
-  )
+        const exit = yield* Fiber.await(fiber)
+        expect(Exit.isSuccess(exit)).toBe(true)
+      }),
+    )
+  }
 
   it.instance("execute creates a child when task_id does not exist", () =>
     Effect.gen(function* () {
@@ -683,71 +855,74 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("promotes a running foreground task without restarting it", () =>
-    Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.Service
-      const { chat, assistant } = yield* seed()
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
-      const ready = yield* Deferred.make<void>()
-      const done = yield* Deferred.make<void>()
-      const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
-      let runs = 0
-      const promptOps: TaskPromptOps = {
-        cancel: () => Effect.void,
-        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
-        prompt: (input) => {
-          if (input.sessionID === chat.id) {
-            return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
-          }
-          return Effect.gen(function* () {
-            runs += 1
-            yield* Deferred.succeed(ready, undefined)
-            yield* Deferred.await(done)
-            return reply(input, "background done")
-          })
-        },
-      }
-
-      const fiber = yield* def
-        .execute(
-          {
-            description: "inspect bug",
-            prompt: "look into the cache key path",
-            subagent_type: "general",
+  for (const fork of [false, true]) {
+    it.instance(`promotes a running foreground task without restarting it (fork=${fork})`, () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const ready = yield* Deferred.make<void>()
+        const done = yield* Deferred.make<void>()
+        const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+        let runs = 0
+        const promptOps: TaskPromptOps = {
+          cancel: () => Effect.void,
+          resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+          prompt: (input) => {
+            if (input.sessionID === chat.id) {
+              return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
+            }
+            return Effect.gen(function* () {
+              runs += 1
+              yield* Deferred.succeed(ready, undefined)
+              yield* Deferred.await(done)
+              return reply(input, "background done")
+            })
           },
-          {
-            sessionID: chat.id,
-            messageID: assistant.id,
-            agent: "build",
-            abort: new AbortController().signal,
-            extra: { promptOps },
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.void,
-          },
-        )
-        .pipe(Effect.forkChild)
+        }
 
-      yield* Deferred.await(ready)
-      const job = (yield* jobs.list())[0]
-      expect(job).toBeDefined()
-      if (!job) throw new Error("task job not found")
-      expect(job.metadata?.parentSessionId).toBe(chat.id)
-      yield* jobs.promote(job.id)
+        const fiber = yield* def
+          .execute(
+            {
+              description: "inspect bug",
+              prompt: "look into the cache key path",
+              subagent_type: fork ? undefined : "general",
+              fork,
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: { promptOps, forkContext: forkContext() },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.forkChild)
 
-      const result = yield* Fiber.join(fiber)
-      expect(result.metadata.background).toBe(true)
-      expect(result.output).toContain(`state="running"`)
-      expect((yield* jobs.get(result.metadata.sessionId))?.status).toBe("running")
-      expect(runs).toBe(1)
+        yield* Deferred.await(ready)
+        const job = (yield* jobs.list())[0]
+        expect(job).toBeDefined()
+        if (!job) throw new Error("task job not found")
+        expect(job.metadata?.parentSessionId).toBe(chat.id)
+        yield* jobs.promote(job.id)
 
-      yield* Deferred.succeed(done, undefined)
-      expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.output).toBe("background done")
-      expect((yield* Deferred.await(injected)).parts[0]?.type).toBe("text")
-      expect(runs).toBe(1)
-    }),
-  )
+        const result = yield* Fiber.join(fiber)
+        expect(result.metadata.background).toBe(true)
+        expect(result.output).toContain(`state="running"`)
+        expect((yield* jobs.get(result.metadata.sessionId))?.status).toBe("running")
+        expect(runs).toBe(1)
+
+        yield* Deferred.succeed(done, undefined)
+        expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.output).toBe("background done")
+        expect((yield* Deferred.await(injected)).parts[0]?.type).toBe("text")
+        expect(runs).toBe(1)
+      }),
+    )
+  }
 
   background.instance("execute launches background tasks without waiting for completion", () =>
     Effect.gen(function* () {
@@ -787,112 +962,118 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("background task completion waits for running updates", () =>
-    Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.Service
-      const { chat, assistant } = yield* seed()
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
-      const first = defer<void>()
-      const second = defer<void>()
-      const updated = defer<SessionPrompt.PromptInput>()
-      const injected = defer<SessionPrompt.PromptInput>()
-      let prompts = 0
-      const promptOps: TaskPromptOps = {
-        ...stubOps(),
-        prompt: (input) => {
-          if (input.sessionID === chat.id) {
-            injected.resolve(input)
-            return Effect.succeed(reply(input, "done"))
-          }
-          prompts++
-          if (prompts === 1) return Effect.promise(() => first.promise).pipe(Effect.as(reply(input, "first done")))
-          updated.resolve(input)
-          return Effect.promise(() => second.promise).pipe(Effect.as(reply(input, "second done")))
-        },
-      }
-      const context = {
-        sessionID: chat.id,
-        messageID: assistant.id,
-        agent: "build",
-        abort: new AbortController().signal,
-        extra: { promptOps },
-        messages: [],
-        metadata: () => Effect.void,
-        ask: () => Effect.void,
-      }
-
-      const started = yield* def.execute(
-        {
-          description: "inspect bug",
-          prompt: "look into the cache key path",
-          subagent_type: "general",
-          background: true,
-        },
-        context,
-      )
-      const result = yield* def.execute(
-        {
-          description: "add investigation scope",
-          prompt: "also inspect cancellation",
-          subagent_type: "general",
-          task_id: started.metadata.sessionId,
-        },
-        context,
-      )
-
-      expect(result.metadata.sessionId).toBe(started.metadata.sessionId)
-      expect(result.metadata.background).toBe(true)
-      expect(result.output).toContain("Background task updated")
-      first.resolve()
-      expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
-      expect((yield* Effect.promise(() => updated.promise)).parts).toEqual([
-        { type: "text", text: "also inspect cancellation" },
-      ])
-
-      second.resolve()
-      const waited = yield* jobs.wait({ id: started.metadata.sessionId, timeout: 1_000 })
-      expect(waited.info?.status).toBe("completed")
-      expect(waited.info?.output).toBe("second done")
-      const notification = yield* Effect.promise(() => injected.promise)
-      expect(notification.variant).toBe("xhigh")
-      expect(notification.parts[0]?.type).toBe("text")
-      if (notification.parts[0]?.type === "text") expect(notification.parts[0].text).toContain("second done")
-    }),
-  )
-
-  background.instance("background tasks complete through the background job service", () =>
-    Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.Service
-      const { chat, assistant } = yield* seed()
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
-
-      const result = yield* def.execute(
-        {
-          description: "inspect bug",
-          prompt: "look into the cache key path",
-          subagent_type: "general",
-          background: true,
-        },
-        {
+  for (const fork of [false, true]) {
+    background.instance(`background task completion waits for running updates (fork=${fork})`, () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const first = defer<void>()
+        const second = defer<void>()
+        const updated = defer<SessionPrompt.PromptInput>()
+        const injected = defer<SessionPrompt.PromptInput>()
+        let prompts = 0
+        const promptOps: TaskPromptOps = {
+          ...stubOps(),
+          prompt: (input) => {
+            if (input.sessionID === chat.id) {
+              injected.resolve(input)
+              return Effect.succeed(reply(input, "done"))
+            }
+            prompts++
+            if (prompts === 1) return Effect.promise(() => first.promise).pipe(Effect.as(reply(input, "first done")))
+            updated.resolve(input)
+            return Effect.promise(() => second.promise).pipe(Effect.as(reply(input, "second done")))
+          },
+        }
+        const context = {
           sessionID: chat.id,
           messageID: assistant.id,
           agent: "build",
           abort: new AbortController().signal,
-          extra: { promptOps: stubOps({ text: "background done" }) },
+          extra: { promptOps, forkContext: forkContext() },
           messages: [],
           metadata: () => Effect.void,
           ask: () => Effect.void,
-        },
-      )
+        }
 
-      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
-      expect(waited.timedOut).toBe(false)
-      expect(waited.info?.status).toBe("completed")
-      expect(waited.info?.output).toBe("background done")
-    }),
-  )
+        const started = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: fork ? undefined : "general",
+            fork,
+            background: true,
+          },
+          context,
+        )
+        const result = yield* def.execute(
+          {
+            description: "add investigation scope",
+            prompt: "also inspect cancellation",
+            subagent_type: fork ? undefined : "general",
+            task_id: started.metadata.sessionId,
+          },
+          context,
+        )
+
+        expect(result.metadata.sessionId).toBe(started.metadata.sessionId)
+        expect(result.metadata.background).toBe(true)
+        expect(result.output).toContain("Background task updated")
+        first.resolve()
+        expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
+        expect((yield* Effect.promise(() => updated.promise)).parts).toEqual([
+          { type: "text", text: "also inspect cancellation" },
+        ])
+
+        second.resolve()
+        const waited = yield* jobs.wait({ id: started.metadata.sessionId, timeout: 1_000 })
+        expect(waited.info?.status).toBe("completed")
+        expect(waited.info?.output).toBe("second done")
+        const notification = yield* Effect.promise(() => injected.promise)
+        expect(notification.variant).toBe("xhigh")
+        expect(notification.parts[0]?.type).toBe("text")
+        if (notification.parts[0]?.type === "text") expect(notification.parts[0].text).toContain("second done")
+      }),
+    )
+  }
+
+  for (const fork of [false, true]) {
+    background.instance(`background tasks complete through the background job service (fork=${fork})`, () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: fork ? undefined : "general",
+            fork,
+            background: true,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ text: "background done" }), forkContext: forkContext() },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+        expect(waited.timedOut).toBe(false)
+        expect(waited.info?.status).toBe("completed")
+        expect(waited.info?.output).toBe("background done")
+      }),
+    )
+  }
 
   background.instance("background task completion does not wait for the parent async prompt", () =>
     Effect.gen(function* () {
@@ -1010,44 +1191,48 @@ describe("tool.task", () => {
     }),
   )
 
-  background.instance("cancelling the parent run cancels running background tasks", () =>
-    Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.Service
-      const runState = yield* SessionRunState.Service
-      const { chat, assistant } = yield* seed()
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
+  for (const fork of [false, true]) {
+    background.instance(`cancelling the parent run cancels running background tasks (fork=${fork})`, () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const runState = yield* SessionRunState.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
 
-      const result = yield* def.execute(
-        {
-          description: "inspect bug",
-          prompt: "look into the cache key path",
-          subagent_type: "general",
-          background: true,
-        },
-        {
-          sessionID: chat.id,
-          messageID: assistant.id,
-          agent: "build",
-          abort: new AbortController().signal,
-          extra: {
-            promptOps: {
-              ...stubOps(),
-              prompt: () => Effect.never,
-            } satisfies TaskPromptOps,
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: fork ? undefined : "general",
+            fork,
+            background: true,
           },
-          messages: [],
-          metadata: () => Effect.void,
-          ask: () => Effect.void,
-        },
-      )
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: {
+              forkContext: forkContext(),
+              promptOps: {
+                ...stubOps(),
+                prompt: () => Effect.never,
+              } satisfies TaskPromptOps,
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
 
-      yield* runState.cancel(chat.id)
-      const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
-      expect(waited.timedOut).toBe(false)
-      expect(waited.info?.status).toBe("cancelled")
-    }),
-  )
+        yield* runState.cancel(chat.id)
+        const waited = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 1_000 })
+        expect(waited.timedOut).toBe(false)
+        expect(waited.info?.status).toBe("cancelled")
+      }),
+    )
+  }
 
   it.instance("cancelling a child run cancels its own pre-runner task job", () =>
     Effect.gen(function* () {

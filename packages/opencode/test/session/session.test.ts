@@ -16,6 +16,9 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { InstanceStore } from "@/project/instance-store"
 import { InstanceBootstrap } from "@/project/bootstrap"
+import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ForkContext } from "@/session/llm/fork"
 
 const it = testEffect(
   AppNodeBuilder.build(
@@ -206,6 +209,138 @@ describe("step-finish token propagation via event", () => {
 })
 
 describe("Session", () => {
+  it.instance("ordinary forks remap or clear inherited fork boundaries before creation", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionNs.Service
+      const events = yield* EventV2Bridge.Service
+      const model = { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") }
+      const ids = [MessageID.make("msg_z-history"), MessageID.make("msg_a-boundary"), MessageID.make("msg_b-later")]
+      const snapshot = ForkContext.capture(
+        { ...model, apiID: "test", npm: "@ai-sdk/openai", agent: "build", variant: "high" },
+        { prompt: [{ role: "user", content: [{ type: "text", text: "cached parent" }] }] },
+      )
+      const metadata = { plugin: { trace: "keep" }, ...ForkContext.metadata(snapshot, ids[1]) }
+      const parent = yield* sessions.create()
+      const original = yield* sessions.create({ parentID: parent.id, metadata })
+      for (const [index, id] of ids.entries()) {
+        yield* sessions.updateMessage({
+          id,
+          sessionID: original.id,
+          role: "user",
+          agent: "build",
+          model,
+          time: { created: index + 1 },
+        })
+      }
+      const created: SessionNs.Info[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type === SessionNs.Event.Created.type) {
+          created.push((event.data as typeof SessionNs.Event.Created.data.Type).info as SessionNs.Info)
+        }
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+      for (const cutoff of [undefined, ids[2], ids[1], ids[0]]) {
+        const fork = yield* sessions.fork({ sessionID: original.id, messageID: cutoff })
+        const messages = yield* sessions.messages({ sessionID: fork.id })
+        const inherited = ForkContext.read(fork.metadata)
+        expect(fork.metadata?.plugin).toEqual(metadata.plugin)
+        expect(fork.metadata?.plugin).not.toBe(metadata.plugin)
+        expect(fork.parentID).toBeUndefined()
+        expect(created.find((info) => info.id === fork.id)?.metadata).toEqual(fork.metadata)
+        expect((yield* sessions.get(fork.id)).metadata).toEqual(fork.metadata)
+        if (cutoff === ids[1] || cutoff === ids[0]) {
+          expect(inherited).toBeUndefined()
+          expect(fork.metadata).toEqual({ plugin: metadata.plugin })
+          continue
+        }
+        expect(inherited?.firstUserMessageID).toBe(messages[1]?.info.id)
+        expect(inherited?.firstUserMessageID).not.toBe(ids[1])
+        expect(inherited?.snapshot).toEqual(snapshot)
+        if (!inherited) throw new Error("Missing fork context")
+        expect(ForkContext.suffix(messages, inherited.firstUserMessageID)).toEqual(messages.slice(1))
+      }
+      expect((yield* sessions.get(original.id)).metadata).toEqual(metadata)
+      yield* sessions.setMetadata({ sessionID: original.id, metadata: { ...metadata, opencode_fork_context: {} } })
+      expect(Exit.isFailure(yield* sessions.fork({ sessionID: original.id }).pipe(Effect.exit))).toBe(true)
+      expect(created).toHaveLength(4)
+    }),
+  )
+
+  it.instance("child forks initialize permissions and remap a mixed-ID history before the cutoff", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionNs.Service
+      const parent = yield* sessions.create({ metadata: { unrelated: "do not copy" } })
+      const model = { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test") }
+      const user = yield* sessions.updateMessage({
+        id: MessageID.make("msg_z-user"),
+        sessionID: parent.id,
+        role: "user",
+        time: { created: 1 },
+        agent: "build",
+        model,
+      })
+      const assistant = yield* sessions.updateMessage({
+        id: MessageID.make("msg_a-assistant"),
+        sessionID: parent.id,
+        role: "assistant",
+        parentID: user.id,
+        time: { created: 2 },
+        agent: "build",
+        mode: "build",
+        modelID: model.modelID,
+        providerID: model.providerID,
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        sessionID: parent.id,
+        messageID: assistant.id,
+        type: "compaction",
+        auto: true,
+        tail_start_id: user.id,
+      })
+      const cutoff = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.make("msg_b-cutoff"),
+        time: { created: 3 },
+      })
+      const child = {
+        parentID: parent.id,
+        title: "fork task",
+        agent: "build",
+        model: { id: model.modelID, providerID: model.providerID, variant: "xhigh" },
+        permission: [{ permission: "bash", pattern: "*", action: "deny" as const }],
+        metadata: { task: true },
+      }
+      const fork = yield* sessions.fork({ sessionID: parent.id, messageID: cutoff.id, child })
+      expect(yield* sessions.get(fork.id)).toMatchObject(child)
+      expect(fork.metadata).toEqual({ task: true })
+      const messages = yield* sessions.messages({ sessionID: fork.id })
+      expect(messages).toHaveLength(2)
+      expect(messages.map((msg) => msg.info.time.created)).toEqual([1, 2])
+      expect(messages[0]?.info.id).not.toBe(user.id)
+      expect(messages[1]?.info).toMatchObject({ parentID: messages[0]?.info.id, sessionID: fork.id })
+      expect(messages[1]?.parts[0]).toMatchObject({
+        tail_start_id: messages[0]?.info.id,
+        messageID: messages[1]?.info.id,
+        sessionID: fork.id,
+      })
+      for (const messageID of [undefined, MessageID.make("msg_missing")]) {
+        expect(Exit.isFailure(yield* sessions.fork({ sessionID: parent.id, messageID, child }).pipe(Effect.exit))).toBe(
+          true,
+        )
+      }
+      expect(yield* sessions.children(parent.id)).toHaveLength(1)
+      const ordinary = yield* sessions.fork({ sessionID: parent.id, messageID: MessageID.make("msg_missing") })
+      expect(yield* sessions.messages({ sessionID: ordinary.id })).toHaveLength(3)
+      expect(ordinary.parentID).toBeUndefined()
+      expect(ordinary.metadata).toEqual(parent.metadata)
+    }),
+  )
+
   it.live("remove works without an instance", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service

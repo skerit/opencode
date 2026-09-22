@@ -29,6 +29,7 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { ForkContext } from "./llm/fork"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -45,6 +46,8 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
+  forkContext?: ForkContext.Turn
+  forkSnapshot?: ForkContext.Snapshot
 }
 
 export type StreamRequest = StreamInput & {
@@ -103,6 +106,21 @@ const live: Layer.Layer<
       )
 
       const isWorkflow = language instanceof GitLabWorkflowLanguageModel
+      const inherited = input.forkSnapshot
+      const isOpenaiOauth = input.model.providerID === "openai" && info?.type === "oauth"
+      if (input.forkContext) delete input.forkContext.snapshot
+      if (
+        inherited &&
+        (inherited.providerID !== input.model.providerID ||
+          inherited.modelID !== input.model.id ||
+          inherited.apiID !== input.model.api.id ||
+          inherited.npm !== input.model.api.npm ||
+          inherited.agent !== input.agent.name ||
+          inherited.variant !== input.user.model.variant)
+      )
+        throw new Error("Fork requires the captured agent, model, and variant")
+      if (inherited && input.user.format?.type === "json_schema")
+        throw new Error("Fork does not support structured output")
       const prepared = yield* LLMRequestPrep.prepare({
         ...input,
         provider: item,
@@ -111,6 +129,16 @@ const live: Layer.Layer<
         flags,
         isWorkflow,
       })
+      if (inherited) prepared.tools = ForkContext.tools(inherited, prepared.tools)
+      if (inherited && isOpenaiOauth) {
+        if (!inherited.cacheSessionID) throw new Error("OpenAI OAuth fork is missing its captured cache session ID")
+        // Cache routing follows the root; x-session-affinity still owns the child's WebSocket pool entry.
+        const headers: Record<string, string> = prepared.headers
+        for (const name of Object.keys(headers)) {
+          if (name.toLowerCase() === "session-id") delete headers[name]
+        }
+        headers["session-id"] = inherited.cacheSessionID
+      }
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system
@@ -223,7 +251,7 @@ const live: Layer.Layer<
 
       // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
       // either returns a ready LLMEvent stream or a concrete fallback reason.
-      if (flags.experimentalNativeLlm) {
+      if (flags.experimentalNativeLlm && !inherited) {
         const native = LLMNativeRuntime.stream({
           model: input.model,
           provider: item,
@@ -321,7 +349,7 @@ const live: Layer.Layer<
           abortSignal: input.abort,
           headers: prepared.headers,
           maxRetries: input.retries ?? 0,
-          messages: prepared.messages,
+          messages: inherited ? input.messages : prepared.messages,
           model: wrapLanguageModel({
             model: language,
             middleware: [
@@ -329,12 +357,53 @@ const live: Layer.Layer<
                 specificationVersion: "v3" as const,
                 async transformParams(args) {
                   if (args.type === "stream") {
+                    args.params = { ...args.params }
+                    const transformOptions = inherited
+                      ? (inherited.request.providerOptions?.[
+                          input.model.api.npm === "@ai-sdk/openai"
+                            ? "openai"
+                            : input.model.api.npm === "@ai-sdk/anthropic"
+                              ? "anthropic"
+                              : input.model.providerID
+                        ] ?? {})
+                      : prepared.messageTransformOptions
                     // @ts-expect-error
                     args.params.prompt = ProviderTransform.message(
                       args.params.prompt,
                       input.model,
-                      prepared.messageTransformOptions,
+                      inherited && input.model.api.npm === "@ai-sdk/anthropic"
+                        ? { ...transformOptions, cacheControl: { type: "ephemeral" } }
+                        : transformOptions,
                     )
+                    if (inherited) args.params = ForkContext.inherit(inherited, args.params)
+                    if (input.forkContext && !input.forkContext.snapshot) {
+                      try {
+                        const cacheSessionID = isOpenaiOauth
+                          ? (new Headers(
+                              Object.entries(args.params.headers ?? {}).filter(
+                                (entry): entry is [string, string] => entry[1] !== undefined,
+                              ),
+                            ).get("session-id") ?? undefined)
+                          : undefined
+                        if (isOpenaiOauth && !cacheSessionID)
+                          throw new Error("OpenAI OAuth fork capture requires a session-id header")
+                        input.forkContext.snapshot = ForkContext.capture(
+                          {
+                            providerID: input.model.providerID,
+                            modelID: input.model.id,
+                            apiID: input.model.api.id,
+                            npm: input.model.api.npm,
+                            agent: input.agent.name,
+                            variant: input.user.model.variant,
+                            ...(isOpenaiOauth ? { cacheSessionID } : {}),
+                          },
+                          args.params,
+                        )
+                      } catch (error) {
+                        // Unsupported parents still run normally; task rejects a fork without a snapshot.
+                        bridge.fork(Effect.logDebug("fork snapshot unavailable", { error }))
+                      }
+                    }
                   }
                   return args.params
                 },

@@ -4,6 +4,7 @@ import { ToolJsonSchema } from "./json-schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { BackgroundJob } from "@/background/job"
 import { Session } from "@/session/session"
+import { ForkContext } from "@/session/llm/fork"
 import { SessionID, MessageID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
@@ -14,6 +15,8 @@ import { Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -43,7 +46,12 @@ const BACKGROUND_UPDATED = [
 const BaseParameterFields = {
   description: Schema.String.annotate({ description: "A short (3-5 words) description of the task" }),
   prompt: Schema.String.annotate({ description: "The task for the agent to perform" }),
-  subagent_type: Schema.String.annotate({ description: "The type of specialized agent to use for this task" }),
+  subagent_type: Schema.optional(Schema.String).annotate({
+    description: "Required for a new isolated task. For fork=true, omit or use the current agent's name.",
+  }),
+  fork: Schema.optional(Schema.Boolean).annotate({
+    description: "Fork the current agent and context into a normal child task. To resume, use task_id without fork.",
+  }),
   task_id: Schema.optional(Schema.String).annotate({
     description:
       "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)",
@@ -116,26 +124,69 @@ export const TaskTool = Tool.define(
         )
       }
 
+      if (params.fork && params.task_id) {
+        return yield* Effect.fail(new Error("To resume a task, use task_id without fork=true"))
+      }
+      if (params.fork && params.subagent_type !== undefined && params.subagent_type !== ctx.agent) {
+        return yield* Effect.fail(
+          new Error("fork=true inherits the current agent; omit subagent_type or use " + ctx.agent),
+        )
+      }
+      const session = params.task_id
+        ? yield* sessions.get(SessionID.make(params.task_id)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+        : undefined
+      const storedFork = ForkContext.identity(session?.metadata)
+      const agentName = params.fork
+        ? ctx.agent
+        : storedFork
+          ? storedFork.agent
+          : (params.subagent_type ?? session?.agent)
+      if (!agentName) return yield* Effect.fail(new Error("subagent_type is required for a new isolated task"))
+      if (storedFork && params.subagent_type !== undefined && params.subagent_type !== agentName) {
+        return yield* Effect.fail(new Error("A forked task must resume with its original agent"))
+      }
       if (!ctx.extra?.bypassAgentCheck) {
         yield* ctx.ask({
           permission: id,
-          patterns: [params.subagent_type],
+          patterns: [agentName],
           always: ["*"],
           metadata: {
             description: params.description,
-            subagent_type: params.subagent_type,
+            subagent_type: agentName,
           },
         })
       }
 
-      const next = yield* agent.get(params.subagent_type)
+      const next = yield* agent.get(agentName)
       if (!next) {
-        return yield* Effect.fail(new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`))
+        return yield* Effect.fail(new Error(`Unknown agent type: ${agentName} is not a valid agent type`))
       }
 
-      const session = params.task_id
-        ? yield* sessions.get(SessionID.make(params.task_id)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-        : undefined
+      const msg = yield* MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }).pipe(
+        Effect.provideService(Database.Service, database),
+        Effect.orDie,
+      )
+      if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
+      const variant = msg.info.variant
+      const turn = ctx.extra?.forkContext as ForkContext.Turn | undefined
+      if (params.fork && !turn?.snapshot) {
+        return yield* Effect.fail(
+          new Error(
+            "fork=true requires a captured provider turn from a configured AI SDK provider; native providers are not supported",
+          ),
+        )
+      }
+      const model = storedFork
+        ? {
+            modelID: ModelV2.ID.make(storedFork.modelID),
+            providerID: ProviderV2.ID.make(storedFork.providerID),
+          }
+        : (!params.fork && next.model) || { modelID: msg.info.modelID, providerID: msg.info.providerID }
+      const childVariant = storedFork ? storedFork.variant : params.fork || !next.model ? variant : undefined
+      const messageID = MessageID.ascending()
+      const forkMetadata = params.fork && turn?.snapshot ? ForkContext.metadata(turn.snapshot, messageID) : undefined
+      const ops = ctx.extra?.promptOps as TaskPromptOps
+      if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
       const childPermission = deriveSubagentSessionPermission({
         parentSessionPermission: parent.permission ?? [],
         subagent: next,
@@ -153,35 +204,34 @@ export const TaskTool = Tool.define(
           action: "deny" as const,
         })) ?? []),
       ]
+      const child = {
+        parentID: ctx.sessionID,
+        title: params.description + ` (@${next.name} subagent)`,
+        agent: next.name,
+        permission: [
+          ...childPermission,
+          ...childToolDenies.filter(
+            (deny) =>
+              !childPermission.some(
+                (rule) =>
+                  rule.permission === deny.permission && rule.pattern === deny.pattern && rule.action === deny.action,
+              ),
+          ),
+        ],
+      }
       const nextSession =
         session ??
-        (yield* sessions.create({
-          parentID: ctx.sessionID,
-          title: params.description + ` (@${next.name} subagent)`,
-          agent: next.name,
-          permission: [
-            ...childPermission,
-            ...childToolDenies.filter(
-              (deny) =>
-                !childPermission.some(
-                  (rule) =>
-                    rule.permission === deny.permission && rule.pattern === deny.pattern && rule.action === deny.action,
-                ),
-            ),
-          ],
-        }))
-
-      const msg = yield* MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }).pipe(
-        Effect.provideService(Database.Service, database),
-        Effect.orDie,
-      )
-      if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
-      const variant = msg.info.variant
-
-      const model = next.model ?? {
-        modelID: msg.info.modelID,
-        providerID: msg.info.providerID,
-      }
+        (yield* forkMetadata
+          ? sessions.fork({
+              sessionID: ctx.sessionID,
+              messageID: ctx.messageID,
+              child: {
+                ...child,
+                model: { id: model.modelID, providerID: model.providerID, variant: childVariant },
+                metadata: forkMetadata,
+              },
+            })
+          : sessions.create(child))
       const metadata = {
         parentSessionId: ctx.sessionID,
         sessionId: nextSession.id,
@@ -194,19 +244,16 @@ export const TaskTool = Tool.define(
         metadata,
       })
 
-      const ops = ctx.extra?.promptOps as TaskPromptOps
-      if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
-
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
         const parts = yield* ops.resolvePromptParts(params.prompt)
         const result = yield* ops.prompt({
-          messageID: MessageID.ascending(),
+          messageID,
           sessionID: nextSession.id,
           model: {
             modelID: model.modelID,
             providerID: model.providerID,
           },
-          variant: next.model ? undefined : variant,
+          variant: childVariant,
           agent: next.name,
           parts,
         })

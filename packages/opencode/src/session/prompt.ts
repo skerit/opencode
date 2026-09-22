@@ -56,6 +56,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { ForkContext } from "./llm/fork"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -1147,6 +1148,12 @@ const layer = Layer.effect(
           }
 
           if (task?.type === "compaction") {
+            const current = yield* sessions.get(sessionID).pipe(Effect.orDie)
+            if (ForkContext.read(current.metadata)) {
+              // Genuine compaction starts a new prefix from the full copied transcript, not the frozen request.
+              session.metadata = ForkContext.clearMetadata(current.metadata)
+              yield* sessions.setMetadata({ sessionID, metadata: session.metadata })
+            }
             const result = yield* compaction.process({
               messages: msgs,
               parentID: lastUser.id,
@@ -1168,6 +1175,7 @@ const layer = Layer.effect(
           }
 
           const agent = yield* agents.get(lastUser.agent)
+          const fork = ForkContext.read(session.metadata)
           if (!agent) {
             const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
             const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
@@ -1222,6 +1230,7 @@ const layer = Layer.effect(
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
             const promptOps = yield* ops()
+            const forkContext: ForkContext.Turn = {}
 
             const tools = yield* SessionTools.resolve({
               agent,
@@ -1231,6 +1240,7 @@ const layer = Layer.effect(
               bypassAgentCheck,
               messages: msgs,
               promptOps,
+              forkContext,
             }).pipe(
               Effect.provideService(Plugin.Service, plugin),
               Effect.provideService(Permission.Service, permission),
@@ -1252,14 +1262,15 @@ const layer = Layer.effect(
             if (step === 1)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
-            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+            const requestMessages = fork ? ForkContext.suffix(msgs, fork.firstUserMessageID) : msgs
+            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: requestMessages })
 
             const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
-              MessageV2.toModelMessagesEffect(msgs, model),
+              MessageV2.toModelMessagesEffect(requestMessages, model),
             ])
             const system = [
               ...env,
@@ -1271,6 +1282,8 @@ const layer = Layer.effect(
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
             const result = yield* handle.process({
               user: lastUser,
+              forkContext,
+              forkSnapshot: fork?.snapshot,
               agent,
               permission: session.permission,
               sessionID,
