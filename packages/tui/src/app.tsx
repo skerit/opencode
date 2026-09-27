@@ -84,7 +84,7 @@ import { DialogVariant } from "./component/dialog-variant"
 import { createTuiAttention } from "./attention"
 import * as TuiAudio from "./audio"
 import { win32DisableProcessedInput, win32FlushInputBuffer } from "./terminal-win32"
-import { destroyRenderer } from "./util/renderer"
+import { destroyRenderer, resumeRenderer, suspendRenderer } from "./util/renderer"
 import { cliErrorMessage, errorFormat } from "./util/error"
 
 registerOpencodeSpinner()
@@ -873,8 +873,8 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         hidden: true,
         enabled: process.platform !== "win32",
         run: () => {
-          renderer.suspend()
-          process.once("SIGCONT", () => renderer.resume())
+          suspendRenderer(renderer)
+          process.once("SIGCONT", () => resumeRenderer(renderer))
           process.kill(0, "SIGTSTP")
         },
       },

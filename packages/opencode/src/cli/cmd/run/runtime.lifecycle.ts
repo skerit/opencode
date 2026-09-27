@@ -13,6 +13,7 @@ import { CliRenderEvents, createCliRenderer, type CliRenderer, type ScrollbackWr
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { Global } from "@opencode-ai/core/global"
 import { openEditor } from "@opencode-ai/tui/editor"
+import { disposeTerminalImages } from "@opencode-ai/tui/images-lifecycle"
 import { registerOpencodeKeymap } from "@opencode-ai/tui/keymap"
 import { Session as SessionApi } from "@/session/session"
 import * as Locale from "@/util/locale"
@@ -92,6 +93,8 @@ function shutdown(renderer: CliRenderer): void {
   if (renderer.isDestroyed) {
     return
   }
+
+  disposeTerminalImages(renderer)
 
   if (renderer.externalOutputMode === "capture-stdout") {
     renderer.externalOutputMode = "passthrough"

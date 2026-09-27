@@ -8,7 +8,8 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { Provider } from "@/provider/provider"
 import { LLM } from "@/session/llm"
 import { ForkContext } from "@/session/llm/fork"
-import { SessionID, MessageID } from "@/session/schema"
+import { SessionID, MessageID, PartID } from "@/session/schema"
+import { MessageV2 } from "@/session/message-v2"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { testEffect } from "../lib/effect"
 import { Auth } from "@/auth"
@@ -38,9 +39,18 @@ test("versioned JSON metadata round trips immutably and rejects corrupt or unsup
   expect(Object.isFrozen(decoded?.snapshot.request.prompt)).toBe(true)
   expect(ForkContext.read({})).toBeUndefined()
   expect(() => ForkContext.read({ opencode_fork_context: { version: 2 } })).toThrow()
+  expect(
+    ForkContext.inherit(
+      ForkContext.capture(identity, {
+        prompt: [{ role: "user", content: [{ type: "file", data: new Uint8Array([1]), mediaType: "image/png" }] }],
+      }),
+      { prompt: [] },
+    ).prompt,
+  ).toEqual([{ role: "user", content: [{ type: "file", data: new Uint8Array([1]), mediaType: "image/png" }] }])
   expect(() =>
     ForkContext.capture(identity, {
-      prompt: [{ role: "user", content: [{ type: "file", data: new Uint8Array([1]), mediaType: "image/png" }] }],
+      prompt: [],
+      providerOptions: { plugin: { invalid: new Date() as never } },
     }),
   ).toThrow("plain JSON")
   expect(() => ForkContext.capture(identity, { prompt: [], responseFormat: { type: "json" } })).toThrow()
@@ -433,6 +443,56 @@ for (const npm of ["@ai-sdk/openai", "@ai-sdk/openai-compatible", "@ai-sdk/anthr
         const turn: ForkContext.Turn = {}
         const agent = { name: "test", mode: "primary" as const, options: {}, permission: [] }
         let executions = 0
+        const history = yield* MessageV2.toModelMessagesEffect(
+          [
+            {
+              info: {
+                id: MessageID.make("msg_tool_history"),
+                sessionID: SessionID.make("ses_parent"),
+                role: "assistant",
+                parentID: MessageID.make("msg_parent"),
+                time: { created: 1 },
+                modelID: model.id,
+                providerID: model.providerID,
+                mode: "primary",
+                agent: "test",
+                path: { cwd: "/tmp/opencode", root: "/tmp/opencode" },
+                cost: 0,
+                tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              },
+              parts: [
+                {
+                  id: PartID.make("prt_tool_history"),
+                  messageID: MessageID.make("msg_tool_history"),
+                  sessionID: SessionID.make("ses_parent"),
+                  type: "tool",
+                  tool: "read",
+                  callID: "call_history",
+                  state: {
+                    status: "completed",
+                    input: { path: "image.png" },
+                    output: "",
+                    title: "Image",
+                    metadata: {},
+                    time: { start: 0, end: 1 },
+                    attachments: [
+                      {
+                        id: PartID.make("prt_image_history"),
+                        messageID: MessageID.make("msg_tool_history"),
+                        sessionID: SessionID.make("ses_parent"),
+                        type: "file",
+                        mime: "image/png",
+                        url: "data:image/png;base64,iVBORw0KGgo=",
+                        filename: "original.png",
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ],
+          model,
+        )
         const input: LLM.StreamInput = {
           sessionID: "ses_parent",
           model,
@@ -446,7 +506,17 @@ for (const npm of ["@ai-sdk/openai", "@ai-sdk/openai-compatible", "@ai-sdk/anthr
             time: { created: 1 },
             model: { providerID: model.providerID, modelID: model.id },
           },
-          messages: [{ role: "user", content: "Parent history" }],
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "image", image: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), mediaType: "image/png" },
+                { type: "text", text: "Parent history" },
+              ],
+            },
+            ...history,
+            { role: "user", content: "Continue after tool image" },
+          ],
           tools: {
             read: tool({
               description: "Parent read schema",
@@ -460,6 +530,8 @@ for (const npm of ["@ai-sdk/openai", "@ai-sdk/openai-compatible", "@ai-sdk/anthr
         expect(turn.snapshot).toBeDefined()
         expect(turn.snapshot?.cacheSessionID).toBeUndefined()
         if (!turn.snapshot) throw new Error("Parent snapshot missing")
+        if (npm !== "@ai-sdk/openai-compatible")
+          expect(JSON.stringify(turn.snapshot.request.prompt)).toContain('"image-data"')
         const restored = ForkContext.read(JSON.parse(JSON.stringify(ForkContext.metadata(turn.snapshot, "child_user"))))
         if (!restored) throw new Error("Metadata missing")
         const nested: ForkContext.Turn = {}
@@ -496,6 +568,7 @@ for (const npm of ["@ai-sdk/openai", "@ai-sdk/openai-compatible", "@ai-sdk/anthr
           })
           .pipe(Stream.runDrain)
         const parentBody = captures[0].body
+        expect(JSON.stringify(parentBody)).toContain("iVBORw0KGgo=")
         for (const capture of captures.slice(1)) {
           expect(capture.body.tools).toEqual(parentBody.tools)
           expect(capture.headers.get("x-session-id")).toBe("ses_child")
@@ -545,6 +618,7 @@ for (const npm of ["@ai-sdk/openai", "@ai-sdk/openai-compatible", "@ai-sdk/anthr
         expect(captures[3].headers.get("x-session-id")).toBe("ses_grandchild")
         expect(captures[3].headers.get("x-parent-session-id")).toBe("ses_child")
         expect(captures[3].body.tools).toEqual(parentBody.tools)
+        expect(JSON.stringify(captures[3].body)).toContain("iVBORw0KGgo=")
       }),
     {
       config: () => ({
@@ -553,7 +627,14 @@ for (const npm of ["@ai-sdk/openai", "@ai-sdk/openai-compatible", "@ai-sdk/anthr
           [providerID]: {
             npm,
             options: { apiKey: "test-key", baseURL: `${server.url.origin}/v1` },
-            models: { [modelID]: { name: modelID, limit: { context: 200000, output: 4096 }, tool_call: true } },
+            models: {
+              [modelID]: {
+                name: modelID,
+                limit: { context: 200000, output: 4096 },
+                tool_call: true,
+                modalities: { input: ["text", "image"], output: ["text"] },
+              },
+            },
           },
         },
       }),

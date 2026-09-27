@@ -23,6 +23,7 @@ import { useEvent } from "../../context/event"
 import { SplitBorder } from "../../ui/border"
 import { useTuiPaths, useTuiTerminalEnvironment } from "../../context/runtime"
 import { Spinner } from "../../component/spinner"
+import { ImageAttachment } from "../../component/image-attachment"
 import { createSyntaxStyleMemo, generateSubtleSyntax, selectedForeground, useTheme } from "../../context/theme"
 import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
 import { Prompt, type PromptRef } from "../../component/prompt"
@@ -1393,7 +1394,7 @@ function UserMessage(props: {
 
   return (
     <>
-      <Show when={text()}>
+      <Show when={text() || files().length}>
         <box
           id={props.message.id}
           ref={(el: BoxRenderable) => alwaysSeparate.add(el)}
@@ -1416,7 +1417,9 @@ function UserMessage(props: {
             backgroundColor={hover() ? theme.backgroundElement : theme.backgroundPanel}
             flexShrink={0}
           >
-            <text fg={theme.text}>{text()}</text>
+            <Show when={text()}>
+              <text fg={theme.text}>{text()}</text>
+            </Show>
             <Show when={files().length}>
               <box flexDirection="row" paddingBottom={metadataVisible() ? 1 : 0} paddingTop={1} gap={1} flexWrap="wrap">
                 <For each={files()}>
@@ -1434,6 +1437,9 @@ function UserMessage(props: {
                 </For>
               </box>
             </Show>
+            <For each={files().filter((file) => file.mime.startsWith("image/"))}>
+              {(file) => <ImageAttachment url={file.url} mime={file.mime} filename={file.filename} />}
+            </For>
             <Show
               when={queued()}
               fallback={
@@ -1579,6 +1585,17 @@ const PART_MAPPING = {
   text: TextPart,
   tool: ToolPart,
   reasoning: ReasoningPart,
+  file: AttachmentPart,
+}
+
+function AttachmentPart(props: { part: Extract<Part, { type: "file" }> }) {
+  return (
+    <Show when={props.part.mime.startsWith("image/")}>
+      <box ref={(el: BoxRenderable) => alwaysSeparate.add(el)} paddingLeft={3} marginTop={1} flexShrink={0}>
+        <ImageAttachment url={props.part.url} mime={props.part.mime} filename={props.part.filename} />
+      </box>
+    </Show>
+  )
 }
 
 const INLINE_TOOL_ICON_WIDTH = 2
@@ -1784,6 +1801,15 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
           <GenericTool {...toolprops} />
         </Match>
       </Switch>
+      <For
+        each={
+          props.part.state.status === "completed"
+            ? props.part.state.attachments?.filter((file) => file.mime.startsWith("image/"))
+            : []
+        }
+      >
+        {(file) => <AttachmentPart part={file} />}
+      </For>
     </Show>
   )
 }
