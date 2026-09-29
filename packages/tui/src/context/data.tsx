@@ -22,7 +22,7 @@ import { createStore, produce } from "solid-js/store"
 import { createSimpleContext } from "./helper"
 import { useSDK } from "./sdk"
 import { useEvent } from "./event"
-import { createSignal, onCleanup, onMount } from "solid-js"
+import { createEffect, createSignal, on, onCleanup, onMount } from "solid-js"
 
 type LocationData = {
   agent?: AgentV2Info[]
@@ -548,8 +548,8 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
       },
     }
 
-    onMount(() => {
-      void Promise.allSettled([
+    const refreshDefault = () =>
+      Promise.allSettled([
         result.location.refresh(),
         result.location.agent.refresh(),
         result.location.integration.refresh(),
@@ -562,7 +562,21 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
         for (const failure of settled.filter((item) => item.status === "rejected"))
           console.error("Failed to refresh default location data", failure.reason)
       })
+
+    onMount(() => {
+      void refreshDefault()
     })
+
+    createEffect(
+      on(
+        () => sdk.directory,
+        (directory) => {
+          setDefaultLocation({ directory: directory ?? process.cwd() })
+          void refreshDefault()
+        },
+        { defer: true },
+      ),
+    )
 
     return result
   },

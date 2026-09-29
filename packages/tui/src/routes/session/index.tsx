@@ -299,7 +299,17 @@ export function Session() {
         return
       }
 
-      if (result.data.workspaceID !== previousWorkspace) {
+      // Requests route to a server instance by directory, so a session from another project needs that project's
+      // instance before it can be prompted. Sessions within the current project keep the current directory; directories
+      // outside any repository all share the "global" project, so those compare by directory instead.
+      const foreign =
+        !result.data.workspaceID &&
+        project.data.project.id !== undefined &&
+        (result.data.projectID !== project.data.project.id ||
+          (result.data.projectID === "global" && result.data.directory !== project.instance.directory()))
+      if (foreign) sdk.setDirectory(result.data.directory)
+
+      if (foreign || result.data.workspaceID !== previousWorkspace) {
         project.workspace.set(result.data.workspaceID)
 
         // Sync all the data for this workspace. Note that this

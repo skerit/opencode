@@ -2,7 +2,7 @@ import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import type { GlobalEvent } from "@opencode-ai/sdk/v2"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { createSimpleContext } from "./helper"
-import { batch, onCleanup, onMount } from "solid-js"
+import { batch, createSignal, onCleanup, onMount } from "solid-js"
 
 export type EventSource = {
   subscribe: (handler: (event: GlobalEvent) => void) => Promise<() => void>
@@ -19,18 +19,26 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
   }) => {
     const abort = new AbortController()
     let sse: AbortController | undefined
+    const [directory, setDirectory] = createSignal(props.directory)
 
-    function createSDK() {
+    function createSDK(target = directory()) {
       return createOpencodeClient({
         baseUrl: props.url,
         signal: abort.signal,
-        directory: props.directory,
+        directory: target,
         fetch: props.fetch,
         headers: props.headers,
       })
     }
 
     let sdk = createSDK()
+    // Cross-project endpoints treat the directory as a filter, and GET requests copy the directory header into the query.
+    const unscoped = createOpencodeClient({
+      baseUrl: props.url,
+      signal: abort.signal,
+      fetch: props.fetch,
+      headers: props.headers,
+    })
 
     const handlers = new Set<(event: GlobalEvent) => void>()
     const emitter = {
@@ -142,7 +150,20 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
       get client() {
         return sdk
       },
-      directory: props.directory,
+      /** A client without a default directory, for endpoints that span every project. */
+      get unscoped() {
+        return unscoped
+      },
+      get directory() {
+        return directory()
+      },
+      /** Points subsequent requests at another server instance; callers must re-bootstrap project and sync state. */
+      setDirectory(next: string) {
+        if (next === directory()) return
+        // Replace the client first: effects tracking the directory run synchronously and must see the new client.
+        sdk = createSDK(next)
+        setDirectory(next)
+      },
       event: emitter,
       fetch: props.fetch ?? fetch,
       url: props.url,

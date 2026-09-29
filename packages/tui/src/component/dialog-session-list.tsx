@@ -18,6 +18,10 @@ import { errorMessage } from "../util/error"
 import { DialogSessionDeleteFailed } from "./dialog-session-delete-failed"
 import { useCommandShortcut } from "../keymap"
 import { useEvent } from "../context/event"
+import { useKV } from "../context/kv"
+import { useTuiPaths } from "../context/runtime"
+import { abbreviateHome } from "../runtime"
+import type { GlobalSession, Session } from "@opencode-ai/sdk/v2"
 
 type SessionListFilter = { scope?: "project"; path?: string }
 
@@ -29,6 +33,21 @@ export function createDialogSessionListQuery(input: { search?: string; filter: S
     ...(search ? { search } : {}),
     ...input.filter,
   }
+}
+
+/** Groups cross-project sessions under their project name, falling back to its worktree or the session directory. */
+export function sessionProjectLabel(session: { directory: string; project?: GlobalSession["project"] }, home: string) {
+  if (session.project?.name) return session.project.name
+  const worktree = session.project?.worktree
+  return abbreviateHome(worktree && worktree !== "/" ? worktree : session.directory, home)
+}
+
+/** Shows where a cross-project session lives relative to its project's worktree. */
+export function sessionProjectFooter(session: { directory: string; project?: GlobalSession["project"] }) {
+  const worktree = session.project?.worktree
+  if (!worktree || worktree === "/" || session.directory === worktree) return ""
+  const relative = path.relative(worktree, session.directory)
+  return relative.startsWith("..") ? "" : relative
 }
 
 export function loadDialogSessionList<T>(input: {
@@ -52,6 +71,9 @@ export function DialogSessionList() {
   const event = useEvent()
   const local = useLocal()
   const toast = useToast()
+  const kv = useKV()
+  const paths = useTuiPaths()
+  const [allProjects, setAllProjects] = createSignal<boolean>(kv.get("session_list_all_projects", false))
   const [toDelete, setToDelete] = createSignal<string>()
   const [deleted, setDeleted] = createSignal(new Set<string>())
   const [search, setSearch] = createDebouncedSignal("", 150)
@@ -59,25 +81,51 @@ export function DialogSessionList() {
   const quickSwitch1 = useCommandShortcut("session.quick_switch.1")
   const quickSwitch9 = useCommandShortcut("session.quick_switch.9")
 
+  const listSessions = (input: { search?: string; filter: SessionListFilter; all: boolean }) =>
+    input.all
+      ? loadDialogSessionList<Session & Partial<Pick<GlobalSession, "project">>>({
+          search: input.search,
+          filter: {},
+          list: (query) => sdk.unscoped.experimental.session.list(query),
+        })
+      : loadDialogSessionList<Session & Partial<Pick<GlobalSession, "project">>>({
+          search: input.search,
+          filter: input.filter,
+          list: (query) => sdk.client.session.list(query),
+        })
   const [browseResults, { refetch: refetchBrowse }] = createResource(
-    () => sync.session.query(),
-    (filter) => loadDialogSessionList({ filter, list: (query) => sdk.client.session.list(query) }),
+    () => ({ filter: sync.session.query(), all: allProjects() }),
+    (input) => listSessions(input),
   )
   const [searchResults, { refetch }] = createResource(
-    () => ({ query: search(), filter: sync.session.query() }),
+    () => ({ query: search(), filter: sync.session.query(), all: allProjects() }),
     (input) => {
       if (!input.query) return undefined
-      return loadDialogSessionList({
-        search: input.query,
-        filter: input.filter,
-        list: (query) => sdk.client.session.list(query),
-      })
+      return listSessions({ search: input.query, filter: input.filter, all: input.all })
+    },
+  )
+  // Status for the current directory arrives at bootstrap; other directories are only covered by live events.
+  createResource(
+    () => (allProjects() ? (searchResults() ?? browseResults()) : undefined),
+    async (list) => {
+      const current = sdk.directory
+      const directories = [...new Set(list.map((session) => session.directory))].filter((item) => item !== current)
+      await Promise.all(
+        directories.slice(0, 20).map(async (directory) => {
+          const result = await sdk.client.session.status({ directory }).catch(() => undefined)
+          for (const [sessionID, status] of Object.entries(result?.data ?? {})) {
+            if (!sync.data.session_status[sessionID]) sync.set("session_status", sessionID, status)
+          }
+        }),
+      )
+      return true
     },
   )
 
   const currentSessionID = createMemo(() => (route.data.type === "session" ? route.data.sessionID : undefined))
   const sessions = createMemo(() => {
-    const result = searchResults() ?? browseResults() ?? sync.data.session
+    const result: (Session & Partial<Pick<GlobalSession, "project">>)[] =
+      searchResults() ?? browseResults() ?? sync.data.session
     const synced = new Map(sync.data.session.map((session) => [session.id, session]))
     const ids = new Set(result.map((session) => session.id))
     const extra = [currentSessionID(), ...local.session.pinned()].flatMap((id) => {
@@ -87,7 +135,7 @@ export function DialogSessionList() {
       return session ? [session] : []
     })
     const query = search().trim().toLowerCase()
-    return [...result.map((session) => synced.get(session.id) ?? session), ...extra]
+    return [...result.map((session) => ({ ...session, ...synced.get(session.id), project: session.project })), ...extra]
       .filter((session) => !deleted().has(session.id))
       .filter((session) => !query || session.title.toLowerCase().includes(query))
   })
@@ -225,13 +273,17 @@ export function DialogSessionList() {
     function buildOption(id: string, category: string) {
       const x = sessionMap.get(id)
       if (!x) return undefined
+      const all = allProjects()
       const directory = x.path
         ? x.directory.endsWith(x.path)
           ? x.directory.slice(0, -x.path.length).replace(/\/$/, "")
           : undefined
         : x.directory
-      const footer =
-        directory && directory !== project.data.project.mainDir ? Locale.truncate(path.basename(directory), 20) : ""
+      const footer = all
+        ? Locale.truncate(sessionProjectFooter(x), 30)
+        : directory && directory !== project.data.project.mainDir
+          ? Locale.truncate(path.basename(directory), 20)
+          : ""
 
       const isDeleting = toDelete() === x.id
       const status = sync.data.session_status?.[x.id]
@@ -246,7 +298,7 @@ export function DialogSessionList() {
         title: isDeleting ? `Press ${deleteHint()} again to confirm` : x.title,
         bg: isDeleting ? theme.error : undefined,
         value: x.id,
-        category,
+        category: all && category !== "Pinned" ? sessionProjectLabel(x, paths.home) : category,
         footer,
         gutter,
       }
@@ -271,7 +323,7 @@ export function DialogSessionList() {
 
   return (
     <DialogSelect
-      title="Sessions"
+      title={allProjects() ? "Sessions (all projects)" : "Sessions"}
       options={options()}
       skipFilter={true}
       preserveSelection={true}
@@ -288,6 +340,15 @@ export function DialogSessionList() {
         dialog.clear()
       }}
       actions={[
+        {
+          command: "session.list.scope",
+          title: allProjects() ? "this project" : "all projects",
+          onTrigger: () => {
+            const next = !allProjects()
+            kv.set("session_list_all_projects", next)
+            setAllProjects(next)
+          },
+        },
         {
           command: "session.pin.toggle",
           title: "pin/unpin",
@@ -306,6 +367,7 @@ export function DialogSessionList() {
               try {
                 const result = await sdk.client.session.delete({
                   sessionID: option.value,
+                  directory: allProjects() ? session?.directory : undefined,
                 })
                 if (result.error) {
                   if (session?.workspaceID) {
