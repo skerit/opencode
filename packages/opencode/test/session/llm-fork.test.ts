@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test"
 import { Cause, Effect, Exit, Layer, Stream } from "effect"
-import { jsonSchema, tool } from "ai"
+import { asSchema, jsonSchema, tool } from "ai"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -8,6 +8,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { Provider } from "@/provider/provider"
 import { LLM } from "@/session/llm"
 import { ForkContext } from "@/session/llm/fork"
+import { CustomTools } from "@/session/llm/custom-tools"
 import { SessionID, MessageID, PartID } from "@/session/schema"
 import { MessageV2 } from "@/session/message-v2"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -112,6 +113,30 @@ test("frozen catalogs use only child bindings and reject missing bindings before
   const denied = ForkContext.tools(snapshot(), {})
   await expect(denied.read.execute?.({}, { toolCallId: "child", messages: [] })).rejects.toThrow("disabled")
   expect(calls).toBe(1)
+})
+
+test("OpenAI custom tools survive capture and rebuild with the child's argument binding", async () => {
+  const format = { type: "grammar", syntax: "lark", definition: 'start: "x"' } as const
+  const custom = { type: "provider", id: "openai.custom", name: "apply_patch", args: { name: "apply_patch", description: "Patch", format } } as const
+  const captured = ForkContext.capture(identity, { prompt: [], tools: [custom] })
+  expect(ForkContext.read(ForkContext.metadata(captured, "first"))?.snapshot.request.tools).toEqual([custom])
+  const calls: unknown[] = []
+  const binding = CustomTools.mark(
+    tool({ inputSchema: jsonSchema({ type: "object" }), execute: async (args) => calls.push(args) }),
+    { argument: "patch", syntax: "lark", definition: 'start: "x"' },
+  )
+  const rebuilt = ForkContext.tools(captured, { apply_patch: binding }).apply_patch!
+  expect(rebuilt).toMatchObject({ type: "provider", id: "openai.custom", args: { name: "apply_patch", format } })
+  expect(CustomTools.freeform(rebuilt)?.argument).toBe("patch")
+  expect(await asSchema(rebuilt.inputSchema).validate?.("x")).toEqual({ success: true, value: { patch: "x" } })
+  await rebuilt.execute?.({ patch: "x" }, { toolCallId: "child", messages: [] })
+  expect(calls).toEqual([{ patch: "x" }])
+  expect(() =>
+    ForkContext.capture(identity, {
+      prompt: [],
+      tools: [{ type: "provider", id: "openai.web_search", name: "web_search", args: {} }],
+    }),
+  ).toThrow("provider-native tools")
 })
 
 const captures: { body: Record<string, unknown>; headers: Headers }[] = []
@@ -295,8 +320,26 @@ oauthTests.instance(
           model: { providerID: model.providerID, modelID: model.id },
         },
         system: ["OAUTH ROOT INSTRUCTIONS"],
-        messages: [{ role: "user", content: "root history" }],
-        tools: { read: tool({ inputSchema: jsonSchema({ type: "object" }), execute: async () => "local" }) },
+        messages: [
+          { role: "user", content: "root history" },
+          {
+            role: "assistant",
+            content: [{ type: "tool-call", toolCallId: "call_patch", toolName: "apply_patch", input: { input: "RAW PATCH" } }],
+          },
+          {
+            role: "tool",
+            content: [
+              { type: "tool-result", toolCallId: "call_patch", toolName: "apply_patch", output: { type: "text", value: "ok" } },
+            ],
+          },
+        ],
+        tools: {
+          read: tool({ inputSchema: jsonSchema({ type: "object" }), execute: async () => "local" }),
+          apply_patch: CustomTools.mark(
+            tool({ inputSchema: jsonSchema({ type: "object" }), execute: async () => "patched" }),
+            { argument: "input", syntax: "lark", definition: 'start: "RAW PATCH"' },
+          ),
+        },
         forkContext: turn,
       }
       yield* llm.stream(parent).pipe(Stream.runDrain)
@@ -340,6 +383,13 @@ oauthTests.instance(
       expect(captures).toHaveLength(3)
       const prefix = captures[0].body.input
       if (!Array.isArray(prefix)) throw new Error("Missing Responses prefix")
+      expect(captures[0].body.tools).toContainEqual({
+        type: "custom",
+        name: "apply_patch",
+        description: "",
+        format: { type: "grammar", syntax: "lark", definition: 'start: "RAW PATCH"' },
+      })
+      expect(prefix).toContainEqual(expect.objectContaining({ type: "custom_tool_call", input: "RAW PATCH" }))
       for (const [index, capture] of captures.entries()) {
         const id = ["ses_oauth_parent", "ses_oauth_child", "ses_oauth_nested"][index]
         expect(capture.headers.get("authorization")).toBe("Bearer local-oauth-access")

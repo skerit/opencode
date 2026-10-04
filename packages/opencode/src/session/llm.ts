@@ -28,6 +28,7 @@ import * as Option from "effect/Option"
 import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
+import { CustomTools } from "./llm/custom-tools"
 import { LLMRequestPrep } from "./llm/request"
 import { ForkContext } from "./llm/fork"
 
@@ -301,6 +302,9 @@ const live: Layer.Layer<
         "llm.provider": input.model.providerID,
         "llm.model": input.model.id,
       })
+      // Only the AI SDK path can send OpenAI custom tools; forks already carry them from the captured request.
+      const tools = CustomTools.apply(input.model, prepared.tools)
+      const messages = CustomTools.unwrap(inherited ? input.messages : prepared.messages, tools)
       // Default runtime path: AI SDK owns provider execution and tool dispatch;
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
       return {
@@ -342,14 +346,14 @@ const live: Layer.Layer<
           topP: prepared.params.topP,
           topK: prepared.params.topK,
           providerOptions: ProviderTransform.providerOptions(input.model, prepared.params.options),
-          activeTools: Object.keys(prepared.tools).filter((x) => x !== "invalid"),
-          tools: prepared.tools,
+          activeTools: Object.keys(tools).filter((x) => x !== "invalid"),
+          tools,
           toolChoice: input.toolChoice,
           maxOutputTokens: prepared.params.maxOutputTokens,
           abortSignal: input.abort,
           headers: prepared.headers,
           maxRetries: input.retries ?? 0,
-          messages: inherited ? input.messages : prepared.messages,
+          messages,
           model: wrapLanguageModel({
             model: language,
             middleware: [

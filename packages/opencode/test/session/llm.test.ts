@@ -21,6 +21,7 @@ import { SessionID, MessageID } from "../../src/session/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Permission } from "@/permission"
 import { LLMAISDK } from "@/session/llm/ai-sdk"
+import { CustomTools } from "@/session/llm/custom-tools"
 import { Session as SessionNs } from "@/session/session"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -1374,6 +1375,153 @@ describe("session.llm.stream", () => {
         expect(maxTokens).toBe(undefined) // match codex cli behavior
       }),
     { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
+  const PATCH_GRAMMAR = 'start: "*** Begin Patch" /(.|\\n)*/'
+  const freeformTool = (calls: unknown[]) =>
+    CustomTools.mark(
+      tool({
+        description: "Apply a patch",
+        inputSchema: z.object({ input: z.string() }),
+        execute: async (args) => {
+          calls.push(args)
+          return { output: "patched", title: "", metadata: {} }
+        },
+      }),
+      { argument: "input", syntax: "lark", definition: PATCH_GRAMMAR },
+    )
+  const freeformHistory = (raw: string): ModelMessage[] => [
+    { role: "user", content: "edit" },
+    {
+      role: "assistant",
+      content: [{ type: "tool-call", toolCallId: "call-old", toolName: "apply_patch", input: { input: raw } }],
+    },
+    {
+      role: "tool",
+      content: [
+        { type: "tool-result", toolCallId: "call-old", toolName: "apply_patch", output: { type: "text", value: "ok" } },
+      ],
+    },
+    { role: "user", content: "again" },
+  ]
+  const freeformInput = (modelID: ModelV2.ID) => {
+    const sessionID = SessionID.make("session-freeform")
+    const agent = {
+      name: "test",
+      mode: "primary",
+      options: {},
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    } satisfies Agent.Info
+    const user = {
+      id: MessageID.make("msg_user-freeform"),
+      sessionID,
+      role: "user",
+      time: { created: Date.now() },
+      agent: agent.name,
+      model: { providerID: ProviderV2.ID.make("openai"), modelID },
+    } satisfies SessionV1.User
+    return { sessionID, agent, user }
+  }
+
+  it.instance(
+    "sends freeform tools as OpenAI custom tools, executes raw text and replays it unwrapped",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const raw = "*** Begin Patch\n[a.ts#1A2B]\nPUT 1.=1:\n+const tab = \"\t\";\n*** End Patch\n"
+        const old = "*** Begin Patch\n[a.ts#1A2B]\nCUT 2.=2\n*** End Patch\n"
+        const item = { type: "custom_tool_call", id: "ctc_1", call_id: "call-new", name: "apply_patch", input: "", status: "in_progress" }
+        const request = waitRequest(
+          "/responses",
+          createEventResponse(
+            [
+              { type: "response.created", response: { id: "resp-1", created_at: 1, model: model.id, service_tier: null } },
+              { type: "response.output_item.added", output_index: 0, item },
+              { type: "response.custom_tool_call_input.delta", output_index: 0, item_id: "ctc_1", delta: raw.slice(0, 7) },
+              { type: "response.custom_tool_call_input.delta", output_index: 0, item_id: "ctc_1", delta: raw.slice(7) },
+              { type: "response.output_item.done", output_index: 0, item: { ...item, input: raw, status: "completed" } },
+              {
+                type: "response.completed",
+                response: {
+                  incomplete_details: null,
+                  usage: { input_tokens: 1, input_tokens_details: null, output_tokens: 1, output_tokens_details: null },
+                  service_tier: null,
+                },
+              },
+            ],
+            true,
+          ),
+        )
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const calls: unknown[] = []
+        yield* drain({
+          ...freeformInput(resolved.id),
+          model: resolved,
+          system: [],
+          messages: freeformHistory(old),
+          tools: { apply_patch: freeformTool(calls) },
+        })
+
+        const body = (yield* Effect.promise(() => request)).body
+        expect(body.tools).toEqual([
+          {
+            type: "custom",
+            name: "apply_patch",
+            description: "Apply a patch",
+            format: { type: "grammar", syntax: "lark", definition: PATCH_GRAMMAR },
+          },
+        ])
+        const replayed = (body.input as { type?: string; input?: string }[]).find(
+          (entry) => entry.type === "custom_tool_call",
+        )
+        expect(replayed?.input).toBe(old)
+        expect(calls).toEqual([{ input: raw }])
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+  )
+
+  it.instance(
+    "keeps freeform tools as JSON function tools on models without custom tool support",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-4.1").model
+        const old = "*** Begin Patch\n[a.ts#1A2B]\nCUT 2.=2\n*** End Patch\n"
+        const request = waitRequest(
+          "/responses",
+          createEventResponse(
+            [
+              { type: "response.created", response: { id: "resp-1", created_at: 1, model: model.id, service_tier: null } },
+              {
+                type: "response.completed",
+                response: {
+                  incomplete_details: null,
+                  usage: { input_tokens: 1, input_tokens_details: null, output_tokens: 1, output_tokens_details: null },
+                  service_tier: null,
+                },
+              },
+            ],
+            true,
+          ),
+        )
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        yield* drain({
+          ...freeformInput(resolved.id),
+          model: resolved,
+          system: [],
+          messages: freeformHistory(old),
+          tools: { apply_patch: freeformTool([]) },
+        })
+
+        const body = (yield* Effect.promise(() => request)).body
+        expect((body.tools as { type: string; name: string }[]).map((entry) => [entry.type, entry.name])).toEqual([
+          ["function", "apply_patch"],
+        ])
+        const replayed = (body.input as { type?: string; arguments?: string }[]).find(
+          (entry) => entry.type === "function_call",
+        )
+        expect(JSON.parse(replayed?.arguments ?? "null")).toEqual({ input: old })
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-4.1").model, `${state.server!.url.origin}/v1`) },
   )
 
   it.instance(

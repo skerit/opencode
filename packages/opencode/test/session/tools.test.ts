@@ -10,6 +10,7 @@ import { Session } from "@/session/session"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { SessionProcessor } from "@/session/processor"
 import { SessionTools } from "@/session/tools"
+import { CustomTools } from "@/session/llm/custom-tools"
 import { Tool } from "@/tool/tool"
 import { ToolRegistry } from "@/tool/registry"
 import { Truncate } from "@/tool/truncate"
@@ -61,6 +62,15 @@ const fakeTruncate = Truncate.Service.of({
   limits: () => Effect.succeed({ maxLines: 2000, maxBytes: 50 * 1024 }),
 } satisfies Truncate.Interface)
 
+const patcher: Tool.Def = {
+  id: "patcher",
+  description: "takes raw patch text",
+  parameters: Schema.Struct({ input: Schema.String }),
+  jsonSchema: { type: "object", properties: { input: { type: "string" } }, required: ["input"] },
+  freeform: { argument: "input", syntax: "lark", definition: 'start: "x"' },
+  execute: () => Effect.succeed({ title: "", metadata: {}, output: "patched" }),
+}
+
 const layer = Layer.mergeAll(
   Layer.succeed(Plugin.Service, fakePlugin),
   Layer.succeed(Permission.Service, fakePermission),
@@ -87,6 +97,7 @@ const layer = Layer.mergeAll(
                 return { title: "timing", metadata: {}, output: "done" }
               }),
           } satisfies Tool.Def,
+          patcher,
         ]),
     }),
   ),
@@ -163,5 +174,21 @@ it.effect("preserves running tool start time across metadata updates", () =>
     if (state.state.status === "running") {
       expect(state.state.time.start).toBe(100)
     }
+  }),
+)
+
+it.effect("marks registry tools that declare freeform input for the LLM request", () =>
+  Effect.gen(function* () {
+    const tools = yield* SessionTools.resolve({
+      agent,
+      model,
+      session: { id: sessionID, permission: [] } as unknown as Session.Info,
+      processor: { message: {}, updateToolCall: () => Effect.die("unused"), completeToolCall: () => Effect.void } as never,
+      bypassAgentCheck: false,
+      messages: [],
+      promptOps: {} as never,
+    })
+    expect(CustomTools.freeform(tools.patcher)).toEqual({ argument: "input", syntax: "lark", definition: 'start: "x"' })
+    expect(CustomTools.freeform(tools.timing)).toBeUndefined()
   }),
 )

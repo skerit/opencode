@@ -24,6 +24,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { isRecord } from "@/util/record"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ForkContext } from "./llm/fork"
+import { CustomTools } from "./llm/custom-tools"
 
 const MCP_RESOURCE_TOOLS = {
   list: "list_mcp_resources",
@@ -138,6 +139,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         )
       },
     })
+    if (item.freeform) CustomTools.mark(tools[item.id], item.freeform)
   }
 
   const hasMcpResourceServer = Object.values(yield* mcp.clients()).some(

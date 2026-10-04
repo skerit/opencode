@@ -60,8 +60,16 @@ export interface Def<
   description: string
   parameters: Parameters
   jsonSchema?: JSONSchema7
+  /** Grammar-constrained raw-text input where the provider supports it; see `CustomTools`. */
+  freeform?: Freeform
   execute(args: Schema.Schema.Type<Parameters>, ctx: Context): Effect.Effect<ExecuteResult<M>>
   formatValidationError?(error: unknown): string
+}
+
+export interface Freeform {
+  argument: string
+  syntax: "lark" | "regex"
+  definition: string
 }
 export type DefWithoutID<
   Parameters extends Schema.Decoder<unknown> = Schema.Decoder<unknown>,

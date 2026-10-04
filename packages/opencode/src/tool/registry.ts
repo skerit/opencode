@@ -135,11 +135,13 @@ const layer = Layer.effect(
           const parameters = zodParams
             ? Schema.declare<unknown>((u): u is unknown => zodParams.safeParse(u).success)
             : Schema.Unknown
+          const freeform = pluginFreeform(def, entries)
           return {
             id,
             parameters,
             jsonSchema,
             description: def.description,
+            ...(freeform && { freeform }),
             execute: (args, toolCtx) =>
               Effect.gen(function* () {
                 // Bridge the host's Effect-based `ask` into a Promise-returning
@@ -331,6 +333,7 @@ const layer = Layer.effect(
               .join("\n"),
             parameters: output.parameters,
             jsonSchema,
+            freeform: tool.freeform,
             execute: tool.execute,
             formatValidationError: tool.formatValidationError,
           }
@@ -354,6 +357,16 @@ function isZodType(value: unknown): value is z.ZodType {
 
 function isPluginTool(value: unknown): value is ToolDefinition {
   return typeof value === "object" && value !== null && "args" in value && "description" in value && "execute" in value
+}
+
+// Malformed declarations are ignored so the tool still registers as an ordinary JSON tool.
+function pluginFreeform(def: ToolDefinition, entries: [string, unknown][]): Tool.Freeform | undefined {
+  const value: unknown = def.freeform
+  if (typeof value !== "object" || value === null) return
+  const { argument, syntax, definition } = value as Record<string, unknown>
+  if (typeof argument !== "string" || !entries.some(([name]) => name === argument)) return
+  if ((syntax !== "lark" && syntax !== "regex") || typeof definition !== "string" || !definition) return
+  return { argument, syntax, definition }
 }
 
 function isJsonSchemaDefinition(value: unknown): value is JSONSchema7Definition {

@@ -1,6 +1,7 @@
 import type { JSONValue, LanguageModelV3CallOptions } from "@ai-sdk/provider"
 import { jsonSchema, type Tool } from "ai"
 import z from "zod"
+import { CustomTools } from "./custom-tools"
 
 // Tags are interpreted only in FilePart.data, never in arbitrary JSON payloads.
 const binary = z
@@ -108,7 +109,7 @@ const prompt = z.array(
     z.object({ role: z.literal("tool"), content: z.array(result), ...partOptions }).strict(),
   ]),
 )
-const definition = z
+const functionDefinition = z
   .object({
     type: z.literal("function"),
     name: z.string(),
@@ -119,6 +120,23 @@ const definition = z
     strict: z.boolean().optional(),
   })
   .strict()
+const customDefinition = z
+  .object({
+    type: z.literal("provider"),
+    id: z.literal("openai.custom"),
+    name: z.string(),
+    args: z
+      .object({
+        name: z.string(),
+        description: z.string().optional(),
+        format: z
+          .object({ type: z.literal("grammar"), syntax: z.enum(["lark", "regex"]), definition: z.string() })
+          .strict(),
+      })
+      .strict(),
+  })
+  .strict()
+const definition = z.union([functionDefinition, customDefinition])
 const request = z
   .object({
     prompt,
@@ -218,7 +236,13 @@ export function capture(
   }
   plain(encoded)
   if (toolChoice && toolChoice.type !== "auto") throw new Error("Fork requires automatic tool choice")
-  if (body.tools?.some((tool) => tool.type !== "function" || tool.name === "StructuredOutput"))
+  if (
+    body.tools?.some(
+      (tool) =>
+        (tool.type !== "function" && !(tool.type === "provider" && tool.id === "openai.custom")) ||
+        tool.name === "StructuredOutput",
+    )
+  )
     throw new Error("Fork does not support provider-native tools or structured output")
   plain(model)
   return freeze(snapshotSchema.parse({ ...model, request: encoded }))
@@ -290,20 +314,36 @@ export function suffix<T extends { info: { id: string; role: string } }>(message
 
 export function tools(snapshot: Snapshot, bindings: Record<string, Tool>): Record<string, Tool> {
   return Object.fromEntries(
-    (snapshot.request.tools ?? []).map((definition) => [
-      definition.name,
-      {
-        description: definition.description,
-        inputSchema: jsonSchema(definition.inputSchema),
-        strict: definition.strict,
-        async execute(args, options) {
-          const binding = Object.hasOwn(bindings, definition.name) ? bindings[definition.name] : undefined
-          if (!binding?.execute)
-            throw new Error(`Fork tool is disabled or unavailable in the child: ${definition.name}`)
-          return binding.execute(args, options)
-        },
-      } satisfies Tool,
-    ]),
+    (snapshot.request.tools ?? []).map((definition) => {
+      const binding = Object.hasOwn(bindings, definition.name) ? bindings[definition.name] : undefined
+      const execute: Tool["execute"] = async (args, options) => {
+        if (!binding?.execute) throw new Error(`Fork tool is disabled or unavailable in the child: ${definition.name}`)
+        return binding.execute(args, options)
+      }
+      if (definition.type === "provider") {
+        // The captured args fix the wire definition; the child's binding supplies the argument the text lands in.
+        const { syntax, definition: grammar } = definition.args.format
+        const argument = CustomTools.freeform(binding)?.argument ?? "input"
+        return [
+          definition.name,
+          CustomTools.custom(
+            definition.name,
+            definition.args.description ?? "",
+            { argument, syntax, definition: grammar },
+            execute,
+          ),
+        ]
+      }
+      return [
+        definition.name,
+        {
+          description: definition.description,
+          inputSchema: jsonSchema(definition.inputSchema),
+          strict: definition.strict,
+          execute,
+        } satisfies Tool,
+      ]
+    }),
   )
 }
 

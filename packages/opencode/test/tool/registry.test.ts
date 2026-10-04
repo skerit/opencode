@@ -299,6 +299,47 @@ describe("tool.registry", () => {
     }),
   )
 
+  it.instance("keeps valid freeform declarations from custom tools and ignores malformed ones", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const customTools = path.join(test.directory, ".opencode", "tools")
+      const pluginTool = pathToFileURL(path.resolve(import.meta.dir, "../../../plugin/src/tool.ts")).href
+      yield* Effect.promise(() => fs.mkdir(customTools, { recursive: true }))
+      const write = (name: string, freeform: string) =>
+        Bun.write(
+          path.join(customTools, `${name}.ts`),
+          [
+            `import { tool } from ${JSON.stringify(pluginTool)}`,
+            "export default tool({",
+            "  description: 'patch files',",
+            "  args: { input: tool.schema.string() },",
+            "  execute: async ({ input }) => input,",
+            `  freeform: ${freeform},`,
+            "})",
+            "",
+          ].join("\n"),
+        )
+      yield* Effect.promise(() => write("patcher", `{ argument: "input", syntax: "lark", definition: 'start: "x"' }`))
+      yield* Effect.promise(() => write("broken", `{ argument: "missing", syntax: "lark", definition: 'start: "x"' }`))
+
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      })
+      expect(tools.find((tool) => tool.id === "patcher")?.freeform).toEqual({
+        argument: "input",
+        syntax: "lark",
+        definition: 'start: "x"',
+      })
+      const broken = tools.find((tool) => tool.id === "broken")
+      expect(broken).toBeDefined()
+      expect(broken?.freeform).toBeUndefined()
+    }),
+  )
+
   it.instance("loads Zod-schema custom tools with JSON Schema and validation", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
